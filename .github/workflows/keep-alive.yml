@@ -1,0 +1,86 @@
+# Keep-alive do backend no Render free.
+#
+# Este arquivo NAO roda no repositorio privado: ele e copiado por
+# `publicar-web.ps1` para `.github/workflows/keep-alive.yml` do repositorio
+# PUBLICO `controlfin-app`. O Actions de repositorio publico e gratuito e nao
+# consome os minutos do plano privado.
+#
+# POR QUE A CADA 5 MINUTOS
+#
+# O Render free dorme depois de ~15 minutos sem requisicao. O cron do GitHub
+# nao e pontual: uma rodada pode atrasar ou ser pulada. Com 5 minutos de
+# intervalo, ainda sobram duas ou tres rodadas antes do limite de 15, entao
+# uma falha isolada nao deixa o app dormir no meio da demonstracao.
+#
+# O /health tambem consulta o banco (`SELECT NOW()`), entao a mesma batida
+# mantem a API e o Postgres acordados.
+#
+# MODO EVENTO (workflow_dispatch com modo=evento)
+#
+# O cron do GitHub nao e garantido. No dia da FENTEC, disparar o modo evento
+# deixa UM job publico pingando a cada 5 minutos por quase 6 horas. Isso nao
+# depende do scheduler e cobre a apresentacao inteira.
+#
+# LIMITE CONHECIDO: o GitHub desativa cron de repositorio sem atividade por
+# 60 dias. A FENTEC e em 11/11/2026, bem dentro da janela; e cada publicacao
+# do app renova a atividade do repositorio.
+
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "normal = uma batida; evento = pinga por ~6h"
+        type: choice
+        options:
+          - normal
+          - evento
+        default: normal
+
+permissions:
+  contents: read
+
+jobs:
+  acordar:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.modo != 'evento'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Acordar API e banco
+        run: |
+          url="https://controlfin-m54z.onrender.com/health"
+          for tentativa in 1 2 3; do
+            inicio=$(date +%s)
+            codigo=$(curl -sS -o /tmp/health.json -w "%{http_code}" \
+              --max-time 100 "$url" || echo "000")
+            fim=$(date +%s)
+            echo "tentativa $tentativa -> HTTP $codigo em $((fim-inicio))s"
+            if [ "$codigo" = "200" ] && grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' /tmp/health.json; then
+              echo "resposta: $(cat /tmp/health.json)"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Nao consegui acordar a API em 3 tentativas."
+          cat /tmp/health.json 2>/dev/null || true
+          exit 1
+
+  evento:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.modo == 'evento'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Manter API acordada durante o evento
+        run: |
+          url="https://controlfin-m54z.onrender.com/health"
+          fim=$(( $(date +%s) + 5*3600 + 45*60 ))
+          while [ "$(date +%s)" -lt "$fim" ]; do
+            codigo=$(curl -sS -o /tmp/health.json -w "%{http_code}" \
+              --max-time 100 "$url" || echo "000")
+            echo "$(date -u +%H:%M:%S) HTTP $codigo $(cat /tmp/health.json 2>/dev/null | head -c 120)"
+            sleep 300
+          done
+          echo "Modo evento encerrado."
